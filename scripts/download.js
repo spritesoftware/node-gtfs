@@ -7,6 +7,7 @@ var request = require('request')
   , unzip = require('unzip')
   , downloadDir = 'downloads'
   , Db = require('mongodb').Db
+  , _ = require('underscore')
   , q;
 
 //load config.js
@@ -65,8 +66,49 @@ var GTFSFiles = [
   {
       fileNameBase: 'trips'
     , collection: 'trips'
+  },
+  {
+      fileNameBase: 'shapes'
+    , collection: 'shapes'
   }
 ];
+
+if (typeof Number.prototype.toRad == 'undefined') {
+  Number.prototype.toRad = function() {
+    return this * Math.PI / 180;
+  }
+}
+
+if (typeof Number.prototype.toDeg == 'undefined') {
+  Number.prototype.toDeg = function() {
+    return this * 180 / Math.PI;
+  }
+}
+
+if (typeof Number.prototype.toPrecisionFixed == 'undefined') {
+  Number.prototype.toPrecisionFixed = function(precision) {
+    
+    // use standard toPrecision method
+    var n = this.toPrecision(precision);
+    
+    // ... but replace +ve exponential format with trailing zeros
+    n = n.replace(/(.+)e\+(.+)/, function(n, sig, exp) {
+      sig = sig.replace(/\./, '');       // remove decimal from significand
+      l = sig.length - 1;
+      while (exp-- > l) sig = sig + '0'; // append zeros from exponent
+      return sig;
+    });
+    
+    // ... and replace -ve exponential format with leading zeros
+    n = n.replace(/(.+)e-(.+)/, function(n, sig, exp) {
+      sig = sig.replace(/\./, '');       // remove decimal from significand
+      while (exp-- > 1) sig = '0' + sig; // prepend zeros from exponent
+      return '0.' + sig;
+    });
+    
+    return n;
+  }
+}
 
 if(!config.agencies){
   handleError(new Error('No agency_key specified in config.js\nTry adding \'capital-metro\' to the agencies in config.js to load transit data'));
@@ -109,7 +151,12 @@ Db.connect(config.mongo_url, {w: 1}, function(err, db) {
   function downloadGTFS(task, cb){
     var agency_key = task.agency_key
       , agency_bounds = {sw: [], ne: []}
-      , agency_url = task.agency_url;
+      , agency_url = task.agency_url
+      , last_shape_id = '~INVALID~'
+      , last_shape_loc
+      , last_shape_sequence_no
+      , shape_distance = 0
+      , assumedVelocity = 50;
 
     console.log('Starting ' + agency_key);
 
@@ -219,11 +266,67 @@ Db.connect(config.mongo_url, {w: 1}, function(err, db) {
                   }
                 }
 
+                //Convert shape points
+                if(line.shape_pt_lat && line.shape_pt_lon){
+
+                  line.shape_pt_sequence = parseInt(line.shape_pt_sequence, 10);
+
+                  line.loc = [parseFloat(line.shape_pt_lon), parseFloat(line.shape_pt_lat)];
+
+                  delete line.shape_pt_lat;
+                  delete line.shape_pt_lon;
+
+                  if(last_shape_id === line.shape_id){
+
+                    var distance = calculateInterCoordDistance(
+                                                last_shape_loc[1],
+                                                last_shape_loc[0],
+                                                line.loc[1],
+                                                line.loc[0]);
+
+                    var backBearing = calculateBearing(
+                                                line.loc[1],
+                                                line.loc[0],
+                                                last_shape_loc[1],
+                                                last_shape_loc[0]);
+
+                    shape_distance += distance;
+
+                    line.time_offset = Math.floor(((shape_distance / assumedVelocity) * 3600));  // Seconds from start of route
+                    line.back_bearing = backBearing;
+
+                  }
+                  else
+                  {
+                    if(last_shape_id !== '~INVALID~'){
+                        var statsLine = new Object();
+
+                        statsLine.shape_id = line.shape_id;
+                        statsLine.total_time = Math.floor(((shape_distance / assumedVelocity) * 3600));  // Seconds from start of route
+
+                        db.collection('shapestats', function(e, shapesStatsCollection){
+                            shapesStatsCollection.insert(statsLine, function(e, inserted) {
+                                if(e) { handleError(e); }
+                            });
+                        });
+                    }
+                    shape_distance = 0;
+                    line.time_offset = 0;
+                    line.back_bearing = -1;
+                  }
+
+                  last_shape_id = line.shape_id;
+                  last_shape_loc = line.loc;
+                  last_shape_sequence_no = line.shape_pt_sequence;
+
+                }
+
                 //insert into db
                 collection.insert(line, function(e, inserted) {
-                  if(e) { handleError(e); }
+                    if(e) { handleError(e); }
                 });
-              })
+
+            })
               .on('end', function(count){
                 cb();
               })
@@ -233,6 +336,38 @@ Db.connect(config.mongo_url, {w: 1}, function(err, db) {
       }, function(e){
         cb(e, 'import');
       });
+    }
+
+    //Return distance between 2 coords in km's
+    function calculateInterCoordDistance(lat1, lon1, lat2, lon2){
+      var R = 6371; // Earth's radius in km
+
+      var lat1 = lat1.toRad(), lon1 = lon1.toRad();
+      var lat2 = lat2.toRad(), lon2 = lon2.toRad();
+      var dLat = lat2 - lat1;
+      var dLon = lon2 - lon1;
+
+      var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1) * Math.cos(lat2) * 
+              Math.sin(dLon/2) * Math.sin(dLon/2);
+      var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      var d = R * c;
+      return d;
+
+    }
+
+    // Calculate the decimal bearing between two decimal coordinates
+    function calculateBearing(lat1, lon1, lat2, lon2){
+      var dLon = (lon2-lon1).toRad();
+
+      lat1 = lat1.toRad(), lat2 = lat2.toRad();
+
+      var dPhi = Math.log(Math.tan(lat2/2+Math.PI/4)/Math.tan(lat1/2+Math.PI/4));
+
+      if (Math.abs(dLon) > Math.PI) dLon = dLon>0 ? -(2*Math.PI-dLon) : (2*Math.PI+dLon);
+
+      var brng = Math.atan2(dLon, dPhi);
+      return (brng.toDeg()+360) % 360;
     }
 
 
